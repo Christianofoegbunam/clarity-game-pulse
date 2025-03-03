@@ -10,6 +10,13 @@
 (define-constant err-invalid-season (err u105))
 (define-constant err-invalid-duration (err u106))
 (define-constant err-rate-limit (err u107))
+(define-constant err-invalid-value (err u108))
+
+;; Rate Limiting
+(define-map update-timestamps
+    { game-id: principal, player-id: principal }
+    { last-update: uint }
+)
 
 ;; Data Variables
 (define-map authorized-games principal bool)
@@ -25,7 +32,7 @@
     }
 )
 
-;; New: Archived player data
+;; Archived player data
 (define-map archived-player-stats
     { game-id: principal, player-id: principal, season: uint }
     {
@@ -35,7 +42,7 @@
     }
 )
 
-;; New: Achievement progress tracking
+;; Achievement progress tracking
 (define-map achievement-progress
     { game-id: principal, player-id: principal, achievement-id: uint }
     {
@@ -45,7 +52,26 @@
     }
 )
 
-[... existing maps ...]
+;; Events
+(define-data-var event-counter uint u0)
+
+(define-public (emit-achievement-event 
+    (game-id principal)
+    (player-id principal)
+    (achievement-id uint)
+    (event-type (string-ascii 20))
+)
+    (let
+        ((counter (var-get event-counter)))
+        (print { counter: counter, 
+                game-id: game-id,
+                player-id: player-id,
+                achievement-id: achievement-id,
+                event-type: event-type })
+        (var-set event-counter (+ counter u1))
+        (ok true)
+    )
+)
 
 ;; Enhanced Authorization Functions
 (define-public (register-game (game-id principal))
@@ -58,11 +84,26 @@
             total-sessions: u0,
             current-season: u1
         })
+        (emit-achievement-event game-id contract-owner u0 "GAME_REGISTERED")
         (ok true)
     )
 )
 
-;; New: Achievement Progress Functions
+;; Rate Limiting Helper
+(define-private (check-rate-limit (game-id principal) (player-id principal))
+    (let ((last-update (default-to { last-update: u0 }
+            (map-get? update-timestamps { game-id: game-id, player-id: player-id }))))
+        (if (> (- block-height (get last-update last-update)) u10)
+            (begin
+                (map-set update-timestamps 
+                    { game-id: game-id, player-id: player-id }
+                    { last-update: block-height })
+                true)
+            false)
+    )
+)
+
+;; Enhanced Achievement Progress Functions
 (define-public (update-achievement-progress
     (game-id principal)
     (player-id principal)
@@ -74,47 +115,38 @@
         (current-progress (default-to { current-value: u0, target-value: u0, last-update: u0 }
             (map-get? achievement-progress { game-id: game-id, player-id: player-id, achievement-id: achievement-id })))
     )
-        (if (is-game-authorized game-id)
-            (begin
-                (map-set achievement-progress
-                    { game-id: game-id, player-id: player-id, achievement-id: achievement-id }
-                    {
-                        current-value: progress-value,
-                        target-value: (get points achievement),
-                        last-update: block-height
-                    }
-                )
-                (ok true)
-            )
-            err-unauthorized
+        (asserts! (is-game-authorized game-id) err-unauthorized)
+        (asserts! (check-rate-limit game-id player-id) err-rate-limit)
+        (asserts! (<= progress-value (get points achievement)) err-invalid-value)
+        
+        (map-set achievement-progress
+            { game-id: game-id, player-id: player-id, achievement-id: achievement-id }
+            {
+                current-value: progress-value,
+                target-value: (get points achievement),
+                last-update: block-height
+            }
         )
+        (emit-achievement-event game-id player-id achievement-id "PROGRESS_UPDATE")
+        (ok true)
     )
 )
 
-;; New: Data Cleanup Functions
-(define-public (archive-player-data
+;; Batch Processing
+(define-public (batch-update-achievements
     (game-id principal)
     (player-id principal)
-    (season uint))
+    (achievement-updates (list 10 { achievement-id: uint, progress-value: uint })))
     
-    (let (
-        (player-data (unwrap! (map-get? player-stats { game-id: game-id, player-id: player-id }) err-unauthorized))
-        (inactive-blocks (- block-height (get last-active player-data)))
-    )
-        (if (and (is-game-authorized game-id) (> inactive-blocks u10000))
-            (begin
-                (map-set archived-player-stats
-                    { game-id: game-id, player-id: player-id, season: season }
-                    {
-                        total-playtime: (get total-playtime player-data),
-                        achievement-points: (get achievement-points player-data),
-                        season-points: (get season-points player-data)
-                    }
-                )
-                (map-delete player-stats { game-id: game-id, player-id: player-id })
-                (ok true)
-            )
-            err-unauthorized
+    (fold check-and-update-achievement achievement-updates (ok true))
+    (where check-and-update-achievement
+        (current-achievement { achievement-id: uint, progress-value: uint })
+        (previous-result (response bool uint))
+        (begin
+            (try! (update-achievement-progress game-id player-id 
+                (get achievement-id current-achievement)
+                (get progress-value current-achievement)))
+            previous-result
         )
     )
 )
